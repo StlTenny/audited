@@ -953,7 +953,7 @@ describe Audited::Auditor do
                       auditable_id: anything,
                       associated_type: owner.class.name,
                       associated_id: owner.id,
-                      created_at: anything}])
+                      created_at: anything}], Audited.store)
       owned_company.save
     end
 
@@ -1053,7 +1053,7 @@ describe Audited::Auditor do
                       auditable_id: anything,
                       associated_type: owner.class.name,
                       associated_id: owner.id,
-                      created_at: anything}])
+                      created_at: anything}], Audited.store)
       owned_company.save
     end
 

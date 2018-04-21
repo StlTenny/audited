@@ -274,7 +274,7 @@ module Audited
       def audit_queue
         raise "nil Audited.async_class" unless Audited.async_class # rescue below
         Audited.async_class.enqueue(Audited.audit_class.name,
-                                    Thread.current[self.class.batched_audit_attrs_sym])
+                                    Thread.current[self.class.batched_audit_attrs_sym], Audited.store)
       rescue
         without_async_auditing do
           Thread.current[self.class.batched_audit_attrs_sym].each do |attrs|
@@ -315,12 +315,6 @@ module Audited
           attrs.delete(:associated)
         end
         attrs[:created_at] = Time.now.utc.round(10).iso8601(6)
-
-        #Run callbacks and merge attributes. Adapter MUST not run callbacks again while saving.
-        klass = Module.const_get(Audited.audit_class.name)
-        k = klass.new(attrs)
-        k.run_callbacks(:create)
-        attrs.merge!(k.attributes)
 
         (Thread.current[self.class.batched_audit_attrs_sym] ||= []) << attrs
       end
