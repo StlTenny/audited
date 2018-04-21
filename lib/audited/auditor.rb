@@ -105,6 +105,21 @@ module Audited
         self.class.without_auditing(&block)
       end
 
+      # Temporarily turns off auditing while saving.
+      def save_without_async_auditing
+        without_async_auditing { save }
+      end
+
+      # Executes the block with synchronous writing.
+      #
+      #   @foo.without_async_auditing do
+      #     @foo.save
+      #   end
+      #
+      def without_async_auditing(&block)
+        self.class.without_async_auditing(&block)
+      end
+
       # Gets an array of the revisions available
       #
       #   user.revisions.each do |revision|
@@ -112,6 +127,7 @@ module Audited
       #     user.version
       #   end
       #
+
       def revisions(from_version = 1)
         return [] unless audits.from_version(from_version).exists?
 
@@ -245,6 +261,27 @@ module Audited
         end
       end
 
+      # Add all of the details necessary for creating an audit record
+      # without having the original objects around. Adds the attributes to a
+      # class attribute that batches them up for later processing.
+      def async_write_audit(attrs)
+        attrs[:auditable_id] = self.id
+        attrs[:auditable_type] = self.class.name
+        attrs.delete(:auditable) # don't bother sending whole object to queue
+        if attrs[:associated]
+          attrs[:associated_id] = attrs[:associated].id
+          attrs[:associated_type] = attrs[:associated].class.name
+          attrs.delete(:associated)
+        end
+        user = Thread.current[:audited_user]
+        if user
+          attrs[:user_id] = user.id
+          attrs[:user_type] = user.class.name
+        end
+        attrs[:created_at] = Time.now
+        (Thread.current[self.class.batched_audit_attrs_sym] ||= []) << attrs
+      end
+
       def presence_of_audit_comment
         if comment_required_state?
           errors.add(:audit_comment, "Comment can't be blank!") unless audit_comment.present?
@@ -297,6 +334,15 @@ module Audited
         audits.each { |audit| attributes.merge!(audit.new_attributes) }
         attributes
       end
+
+      def async_enabled
+        self.class.async_enabled
+      end
+
+      def async_enabled= val
+        self.class.async_enabled = val
+      end
+
     end # InstanceMethods
 
     module AuditedClassMethods
@@ -337,6 +383,28 @@ module Audited
         self.auditing_enabled = true
       end
 
+      # Executes the block with async auditing disabled.
+      #
+      #   Foo.without_async_auditing do
+      #     @foo.save
+      #   end
+      #
+      def without_async_auditing
+        auditing_was_async = async_enabled
+        disable_async
+        yield
+      ensure
+        enable_async if auditing_was_async
+      end
+
+      def disable_async
+        self.async_enabled = false
+      end
+
+      def enable_async
+        self.async_enabled = true
+      end
+
       # All audit operations during the block are recorded as being
       # made by +user+. This is not model specific, the method is a
       # convenience wrapper around
@@ -351,6 +419,14 @@ module Audited
 
       def auditing_enabled=(val)
         Audited.store["#{table_name}_auditing_enabled"] = val
+      end
+
+      def async_enabled
+        Audited.store.fetch("#{self.table_name}_async_enabled", true)
+      end
+
+      def async_enabled= val
+        Audited.store["#{self.table_name}_async_enabled"] = val
       end
 
       def default_ignored_attributes
