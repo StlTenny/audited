@@ -939,7 +939,6 @@ describe Audited::Auditor do
     end
 
     it "should have async enabled" do
-      binding.pry
       expect(owned_company.async_enabled).to be_truthy
     end
 
