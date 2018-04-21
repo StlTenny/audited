@@ -9,7 +9,7 @@ module Audited
     class AuditWorker < ActiveJob::Base
       queue_as :audit
 
-      def self.perform(klass_name, audits_attrs)
+      def perform(klass_name, audits_attrs)
         klass = Module.const_get(klass_name)
         audits_attrs.each do |attrs|
           klass.create(attrs)
