@@ -991,7 +991,7 @@ describe Audited::Auditor do
 
     it "should empty the class variable after saving" do
       owned_company.save
-      expect(Thread.current[owned_company.class.batched_audit_attrs_sym]).to be_nil
+      expect(Thread.current[owned_company.class.batched_audit_attrs_sym]).to be_empty
     end
 
     it "should write synchronously on async error" do
