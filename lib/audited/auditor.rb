@@ -193,6 +193,14 @@ module Audited
         end
       end
 
+      def async_enabled
+        self.class.async_enabled
+      end
+
+      def async_enabled= val
+        self.class.async_enabled = val
+      end
+
       protected
 
       def revision_with(attributes)
@@ -366,14 +374,6 @@ module Audited
         attributes = {}
         audits.each { |audit| attributes.merge!(audit.new_attributes) }
         attributes
-      end
-
-      def async_enabled
-        self.class.async_enabled
-      end
-
-      def async_enabled= val
-        self.class.async_enabled = val
       end
 
     end # InstanceMethods
