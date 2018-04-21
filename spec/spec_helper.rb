@@ -12,6 +12,7 @@ require 'audited'
 require 'audited-rspec'
 require 'audited_spec_helpers'
 require 'support/active_record/models'
+require 'pry-byebug'
 
 SPEC_ROOT = Pathname.new(File.expand_path('../', __FILE__))
 

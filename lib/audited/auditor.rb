@@ -14,7 +14,7 @@ module Audited
   module Auditor #:nodoc:
     extend ActiveSupport::Concern
 
-    CALLBACKS = [:audit_create, :audit_update, :audit_destroy]
+    CALLBACKS = [:audit_create, :audit_update, :audit_destroy, :audit_queue]
 
     module ClassMethods
       # == Configuration options
@@ -73,6 +73,18 @@ module Audited
         after_create :audit_create    if audited_options[:on].include?(:create)
         before_update :audit_update   if audited_options[:on].include?(:update)
         before_destroy :audit_destroy if audited_options[:on].include?(:destroy)
+
+        class_attribute :async_enabled, instance_writer: false
+        if options[:async]
+          class_attribute :async_class, instance_writer: false
+          class_attribute :batched_audit_attrs_sym, instance_writer: false
+          after_commit :audit_queue
+          self.batched_audit_attrs_sym = "#{self.name}_batched_audit_attrs".to_sym
+          Thread.current[self.batched_audit_attrs_sym] = []
+          self.async_enabled = true
+        else
+          self.async_enabled = false
+        end
 
         # Define and set after_audit and around_audit callbacks. This might be useful if you want
         # to notify a party after the audit has been created or if you want to access the newly-created
@@ -246,6 +258,23 @@ module Audited
       def audit_destroy
         write_audit(action: 'destroy', audited_changes: audited_attributes,
                     comment: audit_comment) unless new_record?
+      end
+
+      # Sends batched audits to a queue for processing and empties the
+      # batch. Called after commit. If anything goes wrong, the audit
+      # records are written synchronously.
+      def audit_queue
+        raise "nil Audited.async_class" unless Audited.async_class # rescue below
+        Audited.async_class.enqueue(Audited.audit_class.name,
+                                    Thread.current[self.class.batched_audit_attrs_sym])
+      rescue
+        without_async_auditing do
+          Thread.current[self.class.batched_audit_attrs_sym].each do |attrs|
+            write_audit(attrs)
+          end
+        end
+      ensure
+        Thread.current[self.class.batched_audit_attrs_sym] = []
       end
 
       def write_audit(attrs)
