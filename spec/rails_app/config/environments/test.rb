@@ -55,4 +55,6 @@ RailsApp::Application.configure do
   if Rails::VERSION::MAJOR == 4 && Rails::VERSION::MINOR >= 2
     config.active_record.raise_in_transactional_callbacks = true
   end
+
+  config.active_job.queue_adapter = :inline
 end
