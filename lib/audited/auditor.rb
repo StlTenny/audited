@@ -319,7 +319,7 @@ module Audited
           attrs[:user_id] = user.id
           attrs[:user_type] = user.class.name
         end
-        attrs[:created_at] = Time.now
+        attrs[:created_at] = Time.now.utc.round(10).iso8601(6)
         (Thread.current[self.class.batched_audit_attrs_sym] ||= []) << attrs
       end
 
