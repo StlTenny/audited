@@ -277,11 +277,15 @@ module Audited
         Thread.current[self.class.batched_audit_attrs_sym] = []
       end
 
+
       def write_audit(attrs)
-        attrs[:associated] = send(audit_associated_with) unless audit_associated_with.nil?
+        return unless auditing_enabled
+        attrs[:associated] = self.send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
 
-        if auditing_enabled
+        if self.async_enabled
+          async_write_audit(attrs)
+        else
           run_callbacks(:audit) {
             audit = audits.create(attrs)
             combine_audits_if_needed if attrs[:action] != 'create'
