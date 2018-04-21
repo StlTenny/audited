@@ -287,7 +287,7 @@ module Audited
 
 
       def write_audit(attrs)
-        return unless auditing_enabled
+        return unless auditing_enabled && attrs.present?
         attrs[:associated] = self.send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
 
