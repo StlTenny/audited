@@ -14,7 +14,7 @@ module Audited
   module Auditor #:nodoc:
     extend ActiveSupport::Concern
 
-    CALLBACKS = [:audit_create, :audit_update, :audit_destroy, :audit_queue]
+    CALLBACKS = [:audit_create, :audit_update, :audit_destroy]
 
     module ClassMethods
       # == Configuration options
@@ -33,90 +33,59 @@ module Audited
       #
       # * +require_comment+ - Ensures that audit_comment is supplied before
       #   any create, update or destroy operation.
+      # * +max_audits+ - Limits the number of stored audits.
       #
-      # * +async+ - Batches and asynchronously processes the creation of
-      #   audit records.
+      # * +if+ - Only audit the model when the given function returns true
+      # * +unless+ - Only audit the model when the given function returns false
       #
       #     class User < ActiveRecord::Base
-      #       audited async: true
+      #       audited :if => :active?
+      #
+      #       def active?
+      #         self.status == 'active'
+      #       end
       #     end
-      #
-      #   See the README for details.
-      #
-      #   While audits are being triggered by Audited callbacks, the
-      #   attributes needed to create the audit are saved in class instance
-      #   variables. When transactions are committed, the batched attributes
-      #   are sent to an asynchronous job so the audit records can be
-      #   created.
-      #
-      #   When creating audits asynchronously, if a transaction fails the
-      #   `after_commit` callback will never get run so all of the audits
-      #   will be ignored. This is what we want.
       #
       def audited(options = {})
         # don't allow multiple calls
         return if included_modules.include?(Audited::Auditor::AuditedInstanceMethods)
 
-        class_attribute :non_audited_column_init, instance_accessor: false
-        class_attribute :audit_associated_with,   instance_writer: false
+        extend Audited::Auditor::AuditedClassMethods
+        include Audited::Auditor::AuditedInstanceMethods
 
-        self.non_audited_column_init = -> do
-          if options[:only]
-            except = column_names - Array(options[:only]).flatten.map(&:to_s)
-          else
-            except = default_ignored_attributes + Audited.ignored_attributes
-            except |= Array(options[:except]).collect(&:to_s) if options[:except]
-          end
-          except
-        end
-        self.audit_associated_with = options[:associated_with]
+        class_attribute :audit_associated_with, instance_writer: false
+        class_attribute :audited_options,       instance_writer: false
+        attr_accessor :version, :audit_comment
 
-        if options[:comment_required]
-          validates_presence_of :audit_comment, if: :auditing_enabled
-          before_destroy :require_comment
+        self.audited_options = options
+        normalize_audited_options
+
+        self.audit_associated_with = audited_options[:associated_with]
+
+        if audited_options[:comment_required]
+          validate :presence_of_audit_comment
+          before_destroy :require_comment if audited_options[:on].include?(:destroy)
         end
 
-        attr_accessor :audit_comment
-
-        has_many :audits, -> { order(version: :asc) }, as: :auditable, class_name: Audited.audit_class.name
+        has_many :audits, -> { order(version: :asc) }, as: :auditable, class_name: Audited.audit_class.name, inverse_of: :auditable
         Audited.audit_class.audited_class_names << to_s
 
-        after_create :audit_create if !options[:on] || (options[:on] && options[:on].include?(:create))
-        before_update :audit_update if !options[:on] || (options[:on] && options[:on].include?(:update))
-        before_destroy :audit_destroy if !options[:on] || (options[:on] && options[:on].include?(:destroy))
-
-        class_attribute :async_enabled, instance_writer: false
-        if options[:async]
-          class_attribute :async_class, instance_writer: false
-          class_attribute :batched_audit_attrs_sym, instance_writer: false
-          after_commit :audit_queue
-          self.batched_audit_attrs_sym = "#{self.name}_batched_audit_attrs".to_sym
-          self.async_enabled = true
-        else
-          self.async_enabled = false
-        end
+        after_create :audit_create    if audited_options[:on].include?(:create)
+        before_update :audit_update   if audited_options[:on].include?(:update)
+        before_destroy :audit_destroy if audited_options[:on].include?(:destroy)
 
         # Define and set after_audit and around_audit callbacks. This might be useful if you want
         # to notify a party after the audit has been created or if you want to access the newly-created
         # audit.
         define_callbacks :audit
-        set_callback :audit, :after, :after_audit, if: lambda { self.respond_to?(:after_audit) }
-        set_callback :audit, :around, :around_audit, if: lambda { self.respond_to?(:around_audit) }
+        set_callback :audit, :after, :after_audit, if: lambda { respond_to?(:after_audit, true) }
+        set_callback :audit, :around, :around_audit, if: lambda { respond_to?(:around_audit, true) }
 
-        attr_accessor :version
-
-        extend Audited::Auditor::AuditedClassMethods
-        include Audited::Auditor::AuditedInstanceMethods
-
-        self.auditing_enabled = true
+        enable_auditing
       end
 
       def has_associated_audits
         has_many :associated_audits, as: :associated, class_name: Audited.audit_class.name
-      end
-
-      def default_ignored_attributes
-        [primary_key, inheritance_column]
       end
     end
 
@@ -136,21 +105,6 @@ module Audited
         self.class.without_auditing(&block)
       end
 
-      # Temporarily turns off auditing while saving.
-      def save_without_async_auditing
-        without_async_auditing { save }
-      end
-
-      # Executes the block with synchronous writing.
-      #
-      #   @foo.without_async_auditing do
-      #     @foo.save
-      #   end
-      #
-      def without_async_auditing(&block)
-        self.class.without_async_auditing(&block)
-      end
-
       # Gets an array of the revisions available
       #
       #   user.revisions.each do |revision|
@@ -159,18 +113,25 @@ module Audited
       #   end
       #
       def revisions(from_version = 1)
-        audits = self.audits.from_version(from_version)
-        return [] if audits.empty?
-        revisions = []
-        audits.each do |audit|
-          revisions << audit.revision
+        return [] unless audits.from_version(from_version).exists?
+
+        all_audits = audits.select([:audited_changes, :version]).to_a
+        targeted_audits = all_audits.select { |audit| audit.version >= from_version }
+
+        previous_attributes = reconstruct_attributes(all_audits - targeted_audits)
+
+        targeted_audits.map do |audit|
+          previous_attributes.merge!(audit.new_attributes)
+          revision_with(previous_attributes.merge!(version: audit.version))
         end
-        revisions
       end
 
       # Get a specific revision specified by the version number, or +:previous+
+      # Returns nil for versions greater than revisions count
       def revision(version)
-        revision_with Audited.audit_class.reconstruct_attributes(audits_to(version))
+        if version == :previous || self.audits.last.version >= version
+          revision_with Audited.audit_class.reconstruct_attributes(audits_to(version))
+        end
       end
 
       # Find the oldest revision recorded prior to the date/time provided.
@@ -181,11 +142,27 @@ module Audited
 
       # List of attributes that are audited.
       def audited_attributes
-        attributes.except(*non_audited_columns)
+        attributes.except(*self.class.non_audited_columns)
       end
 
-      def non_audited_columns
-        self.class.non_audited_columns
+      # Returns a list combined of record audits and associated audits.
+      def own_and_associated_audits
+        Audited.audit_class.unscoped
+        .where('(auditable_type = :type AND auditable_id = :id) OR (associated_type = :type AND associated_id = :id)',
+          type: self.class.name, id: id)
+        .order(created_at: :desc)
+      end
+
+      # Combine multiple audits into one.
+      def combine_audits(audits_to_combine)
+        combine_target = audits_to_combine.last
+        combine_target.audited_changes = audits_to_combine.pluck(:audited_changes).reduce(&:merge)
+        combine_target.comment = "#{combine_target.comment}\nThis audit is the result of multiple audits being combined."
+
+        transaction do
+          combine_target.save!
+          audits_to_combine.unscope(:limit).where("version < ?", combine_target.version).delete_all
+        end
       end
 
       protected
@@ -193,9 +170,8 @@ module Audited
       def revision_with(attributes)
         dup.tap do |revision|
           revision.id = id
-          revision.send :instance_variable_set, '@attributes', self.attributes if rails_below?('4.2.0')
-          revision.send :instance_variable_set, '@new_record', self.destroyed?
-          revision.send :instance_variable_set, '@persisted', !self.destroyed?
+          revision.send :instance_variable_set, '@new_record', destroyed?
+          revision.send :instance_variable_set, '@persisted', !destroyed?
           revision.send :instance_variable_set, '@readonly', false
           revision.send :instance_variable_set, '@destroyed', false
           revision.send :instance_variable_set, '@_destroyed', false
@@ -207,7 +183,7 @@ module Audited
           # to determine if an instance variable is a proxy object is to
           # see if it responds to certain methods, as it forwards almost
           # everything to its target.
-          for ivar in revision.instance_variables
+          revision.instance_variables.each do |ivar|
             proxy = revision.instance_variable_get ivar
             if !proxy.nil? && proxy.respond_to?(:proxy_respond_to?)
               revision.instance_variable_set ivar, nil
@@ -216,16 +192,14 @@ module Audited
         end
       end
 
-      def rails_below?(rails_version)
-        Gem::Version.new(Rails::VERSION::STRING) < Gem::Version.new(rails_version)
-      end
-
       private
 
       def audited_changes
-        changed_attributes.except(*non_audited_columns).inject({}) do |changes, (attr, old_value)|
-          changes[attr] = [old_value, self[attr]]
-          changes
+        all_changes = respond_to?(:changes_to_save) ? changes_to_save : changes
+        if audited_options[:only].present?
+          all_changes.slice(*self.class.audited_columns)
+        else
+          all_changes.except(*self.class.non_audited_columns)
         end
       end
 
@@ -255,66 +229,47 @@ module Audited
 
       def audit_destroy
         write_audit(action: 'destroy', audited_changes: audited_attributes,
-                    comment: audit_comment) unless self.new_record?
-      end
-
-      # Sends batched audits to a queue for processing and empties the
-      # batch. Called after commit. If anything goes wrong, the audit
-      # records are written synchronously.
-      def audit_queue
-        attrs = Thread.current[self.class.batched_audit_attrs_sym]
-        return unless attrs && attrs.length > 0
-
-        raise "nil Audited.async_class" unless Audited.async_class # rescue below
-        Audited.async_class.enqueue(Audited.audit_class.name, attrs)
-      rescue
-        without_async_auditing do
-          attrs.each do |audit_attrs|
-            write_audit(audit_attrs)
-          end
-        end
-      ensure
-        Thread.current[self.class.batched_audit_attrs_sym] = nil
+                    comment: audit_comment) unless new_record?
       end
 
       def write_audit(attrs)
-        return unless auditing_enabled
-
-        attrs[:associated] = self.send(audit_associated_with) unless audit_associated_with.nil?
+        attrs[:associated] = send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
-        if self.async_enabled
-          async_write_audit(attrs)
-        else
-          run_callbacks(:audit) { self.audits.create(attrs) } if auditing_enabled
+
+        if auditing_enabled
+          run_callbacks(:audit) {
+            audit = audits.create(attrs)
+            combine_audits_if_needed if attrs[:action] != 'create'
+            audit
+          }
         end
       end
 
-      # Add all of the details necessary for creating an audit record
-      # without having the original objects around. Adds the attributes to a
-      # class attribute that batches them up for later processing.
-      def async_write_audit(attrs)
-        attrs[:auditable_id] = self.id
-        attrs[:auditable_type] = self.class.name
-        attrs.delete(:auditable) # don't bother sending whole object to queue
-        if attrs[:associated]
-          attrs[:associated_id] = attrs[:associated].id
-          attrs[:associated_type] = attrs[:associated].class.name
-          attrs.delete(:associated)
+      def presence_of_audit_comment
+        if comment_required_state?
+          errors.add(:audit_comment, "Comment can't be blank!") unless audit_comment.present?
         end
-        user = Thread.current[:audited_user]
-        if user
-          attrs[:user_id] = user.id
-          attrs[:user_type] = user.class.name
+      end
+
+      def comment_required_state?
+        auditing_enabled &&
+          ((audited_options[:on].include?(:create) && self.new_record?) ||
+          (audited_options[:on].include?(:update) && self.persisted? && self.changed?))
+      end
+
+      def combine_audits_if_needed
+        max_audits = audited_options[:max_audits]
+        if max_audits && (extra_count = audits.count - max_audits) > 0
+          audits_to_combine = audits.limit(extra_count + 1)
+          combine_audits(audits_to_combine)
         end
-        attrs[:created_at] = Time.now
-        (Thread.current[self.class.batched_audit_attrs_sym] ||= []) << attrs
       end
 
       def require_comment
         if auditing_enabled && audit_comment.blank?
-          errors.add(:audit_comment, "Comment required before destruction")
+          errors.add(:audit_comment, "Comment can't be blank!")
           return false if Rails.version.start_with?('4.')
-          throw :abort
+          throw(:abort)
         end
       end
 
@@ -322,35 +277,42 @@ module Audited
         alias_method "#{attr_name}_callback".to_sym, attr_name
       end
 
-      def empty_callback #:nodoc:
-      end
-
       def auditing_enabled
-        self.class.auditing_enabled
+        return run_conditional_check(audited_options[:if]) &&
+          run_conditional_check(audited_options[:unless], matching: false) &&
+          self.class.auditing_enabled
       end
 
-      def auditing_enabled= val
-        self.class.auditing_enabled = val
+      def run_conditional_check(condition, matching: true)
+        return true if condition.blank?
+
+        return condition.call(self) == matching if condition.respond_to?(:call)
+        return send(condition) == matching if respond_to?(condition.to_sym)
+
+        true
       end
 
-      def async_enabled
-        self.class.async_enabled
+      def reconstruct_attributes(audits)
+        attributes = {}
+        audits.each { |audit| attributes.merge!(audit.new_attributes) }
+        attributes
       end
-
-      def async_enabled= val
-        self.class.async_enabled = val
-      end
-
     end # InstanceMethods
 
     module AuditedClassMethods
       # Returns an array of columns that are audited. See non_audited_columns
       def audited_columns
-        columns.select {|c| !non_audited_columns.include?(c.name) }
+        @audited_columns ||= column_names - non_audited_columns
       end
 
+      # We have to calculate this here since column_names may not be available when `audited` is called
       def non_audited_columns
-        @non_audited_columns ||= non_audited_column_init.call
+        @non_audited_columns ||= calculate_non_audited_columns
+      end
+
+      def non_audited_columns=(columns)
+        @audited_columns = nil # reset cached audited columns on assignment
+        @non_audited_columns = columns.map(&:to_s)
       end
 
       # Executes the block with auditing disabled.
@@ -375,28 +337,6 @@ module Audited
         self.auditing_enabled = true
       end
 
-      # Executes the block with async auditing disabled.
-      #
-      #   Foo.without_async_auditing do
-      #     @foo.save
-      #   end
-      #
-      def without_async_auditing
-        auditing_was_async = async_enabled
-        disable_async
-        yield
-      ensure
-        enable_async if auditing_was_async
-      end
-
-      def disable_async
-        self.async_enabled = false
-      end
-
-      def enable_async
-        self.async_enabled = true
-      end
-
       # All audit operations during the block are recorded as being
       # made by +user+. This is not model specific, the method is a
       # convenience wrapper around
@@ -406,19 +346,36 @@ module Audited
       end
 
       def auditing_enabled
-        Audited.store.fetch("#{self.table_name}_auditing_enabled", true)
+        Audited.store.fetch("#{table_name}_auditing_enabled", true) && Audited.auditing_enabled
       end
 
-      def auditing_enabled= val
-        Audited.store["#{self.table_name}_auditing_enabled"] = val
+      def auditing_enabled=(val)
+        Audited.store["#{table_name}_auditing_enabled"] = val
       end
 
-      def async_enabled
-        Audited.store.fetch("#{self.table_name}_async_enabled", true)
+      def default_ignored_attributes
+        [primary_key, inheritance_column] | Audited.ignored_attributes
       end
 
-      def async_enabled= val
-        Audited.store["#{self.table_name}_async_enabled"] = val
+      protected
+
+      def normalize_audited_options
+        audited_options[:on] = Array.wrap(audited_options[:on])
+        audited_options[:on] = [:create, :update, :destroy] if audited_options[:on].empty?
+        audited_options[:only] = Array.wrap(audited_options[:only]).map(&:to_s)
+        audited_options[:except] = Array.wrap(audited_options[:except]).map(&:to_s)
+        max_audits = audited_options[:max_audits] || Audited.max_audits
+        audited_options[:max_audits] = Integer(max_audits).abs if max_audits
+      end
+
+      def calculate_non_audited_columns
+        if audited_options[:only].present?
+          (column_names | default_ignored_attributes) - audited_options[:only]
+        elsif audited_options[:except].present?
+          default_ignored_attributes | audited_options[:except]
+        else
+          default_ignored_attributes
+        end
       end
     end
   end
