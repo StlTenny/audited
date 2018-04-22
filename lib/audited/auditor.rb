@@ -291,6 +291,31 @@ module Audited
         attrs[:associated] = self.send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
 
+        augmented_attrs = augment_attrs(attrs)
+
+        if self.async_enabled
+          # Audit Call backs are not called
+          # Combine audits are not called
+          async_write_audit(augmented_attrs)
+        else
+          run_callbacks(:audit) {
+            audit = audits.create(augmented_attrs)
+            combine_audits_if_needed if augmented_attrs[:action] != 'create'
+            audit
+          }
+        end
+      end
+
+      def augment_attrs(attrs)
+        attrs[:auditable_id] = self.id
+        attrs[:auditable_type] = self.class.name
+        attrs.delete(:auditable) # don't bother sending whole object to queue
+        if attrs[:associated]
+          attrs[:associated_id] = attrs[:associated].id
+          attrs[:associated_type] = attrs[:associated].class.name
+          attrs.delete(:associated)
+        end
+
         # Set up before_create attributes manually so that this can work async too
         user = audit_user
         if user
@@ -304,32 +329,14 @@ module Audited
 
         attrs[:request_uuid] = request_uuid
         attrs[:remote_address] = remote_address
-
-        if self.async_enabled
-          async_write_audit(attrs)
-        else
-          run_callbacks(:audit) {
-            audit = audits.create(attrs)
-            combine_audits_if_needed if attrs[:action] != 'create'
-            audit
-          }
-        end
+        attrs[:created_at] = Time.now.utc.round(10).iso8601(6)
+        attrs
       end
 
       # Add all of the details necessary for creating an audit record
       # without having the original objects around. Adds the attributes to a
       # class attribute that batches them up for later processing.
       def async_write_audit(attrs)
-        attrs[:auditable_id] = self.id
-        attrs[:auditable_type] = self.class.name
-        attrs.delete(:auditable) # don't bother sending whole object to queue
-        if attrs[:associated]
-          attrs[:associated_id] = attrs[:associated].id
-          attrs[:associated_type] = attrs[:associated].class.name
-          attrs.delete(:associated)
-        end
-        attrs[:created_at] = Time.now.utc.round(10).iso8601(6)
-
         (Thread.current[self.class.batched_audit_attrs_sym] ||= []) << attrs
       end
 
