@@ -306,6 +306,10 @@ module Audited
         end
       end
 
+      # Overridable method
+      # Populate `Audit` record attributes in an attributes hash
+      # Executed synchronously. So avoid database calls.
+      # Use `before_create` callbacks for database calls.
       def augment_attrs(attrs)
         attrs[:auditable_id] = self.id
         attrs[:auditable_type] = self.class.name
