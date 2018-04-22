@@ -949,11 +949,13 @@ describe Audited::Auditor do
                      {action: "create",
                       audited_changes: {"name"=>"The auditors", "owner_id"=>owner.id},
                       comment: nil,
+                      request_uuid: anything,
+                      remote_address: nil,
                       auditable_type: owned_company.class.name,
                       auditable_id: anything,
                       associated_type: owner.class.name,
                       associated_id: owner.id,
-                      created_at: anything}], Audited.store)
+                      created_at: anything}])
       owned_company.save
     end
 
@@ -1049,11 +1051,13 @@ describe Audited::Auditor do
                      {action: "create",
                       audited_changes: {"name"=>"The auditors", "owner_id"=>owner.id},
                       comment: nil,
+                      request_uuid: anything,
+                      remote_address: nil,
                       auditable_type: owned_company.class.name,
                       auditable_id: anything,
                       associated_type: owner.class.name,
                       associated_id: owner.id,
-                      created_at: anything}], Audited.store)
+                      created_at: anything}])
       owned_company.save
     end
 

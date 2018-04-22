@@ -38,7 +38,8 @@ module Audited
     belongs_to :user,       polymorphic: true
     belongs_to :associated, polymorphic: true
 
-    before_create :set_version_number, :set_audit_user, :set_request_uuid, :set_remote_address
+    # before_create :set_version_number, :set_audit_user, :set_request_uuid, :set_remote_address
+    before_create :set_version_number
 
     cattr_accessor :audited_class_names
     self.audited_class_names = Set.new

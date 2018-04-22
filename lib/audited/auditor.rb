@@ -274,7 +274,7 @@ module Audited
       def audit_queue
         raise "nil Audited.async_class" unless Audited.async_class # rescue below
         Audited.async_class.enqueue(Audited.audit_class.name,
-                                    Thread.current[self.class.batched_audit_attrs_sym], Audited.store)
+                                    Thread.current[self.class.batched_audit_attrs_sym])
       rescue
         without_async_auditing do
           Thread.current[self.class.batched_audit_attrs_sym].each do |attrs|
@@ -290,6 +290,20 @@ module Audited
         return unless auditing_enabled && attrs.present?
         attrs[:associated] = self.send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
+
+        # Set up before_create attributes manually so that this can work async too
+        user = audit_user
+        if user
+          if user.is_a?(::ActiveRecord::Base)
+            attrs[:user_id] = user.id
+            attrs[:user_type] = user.class.name
+          else
+            attrs[:username] = user
+          end
+        end
+
+        attrs[:request_uuid] = request_uuid
+        attrs[:remote_address] = remote_address
 
         if self.async_enabled
           async_write_audit(attrs)
@@ -317,6 +331,18 @@ module Audited
         attrs[:created_at] = Time.now.utc.round(10).iso8601(6)
 
         (Thread.current[self.class.batched_audit_attrs_sym] ||= []) << attrs
+      end
+
+      def audit_user
+        ::Audited.store[:audited_user] || ::Audited.store[:current_user].try!(:call)
+      end
+
+      def request_uuid
+       ::Audited.store[:current_request_uuid] || SecureRandom.uuid
+      end
+
+      def remote_address
+       ::Audited.store[:current_remote_address]
       end
 
       def presence_of_audit_comment
