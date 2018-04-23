@@ -3,5 +3,6 @@ module Audited
     extend ActiveSupport::Autoload
     autoload :Resque
     autoload :Synchronous
+    autoload :AuditActiveJob
   end
 end

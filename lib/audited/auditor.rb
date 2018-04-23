@@ -14,7 +14,7 @@ module Audited
   module Auditor #:nodoc:
     extend ActiveSupport::Concern
 
-    CALLBACKS = [:audit_create, :audit_update, :audit_destroy]
+    CALLBACKS = [:audit_create, :audit_update, :audit_destroy, :audit_queue]
 
     module ClassMethods
       # == Configuration options
@@ -73,6 +73,18 @@ module Audited
         after_create :audit_create    if audited_options[:on].include?(:create)
         before_update :audit_update   if audited_options[:on].include?(:update)
         before_destroy :audit_destroy if audited_options[:on].include?(:destroy)
+
+        class_attribute :async_enabled, instance_writer: false
+        if options[:async]
+          class_attribute :async_class, instance_writer: false
+          class_attribute :batched_audit_attrs_sym, instance_writer: false
+          after_commit :audit_queue
+          self.batched_audit_attrs_sym = "#{self.name}_batched_audit_attrs".to_sym
+          Thread.current[self.batched_audit_attrs_sym] = []
+          self.async_enabled = true
+        else
+          self.async_enabled = false
+        end
 
         # Define and set after_audit and around_audit callbacks. This might be useful if you want
         # to notify a party after the audit has been created or if you want to access the newly-created
@@ -181,6 +193,14 @@ module Audited
         end
       end
 
+      def async_enabled
+        self.class.async_enabled
+      end
+
+      def async_enabled= val
+        self.class.async_enabled = val
+      end
+
       protected
 
       def revision_with(attributes)
@@ -248,23 +268,49 @@ module Audited
                     comment: audit_comment) unless new_record?
       end
 
+      # Sends batched audits to a queue for processing and empties the
+      # batch. Called after commit. If anything goes wrong, the audit
+      # records are written synchronously.
+      def audit_queue
+        raise "nil Audited.async_class" unless Audited.async_class # rescue below
+        Audited.async_class.enqueue(Audited.audit_class.name,
+                                    Thread.current[self.class.batched_audit_attrs_sym])
+      rescue
+        without_async_auditing do
+          Thread.current[self.class.batched_audit_attrs_sym].each do |attrs|
+            write_audit(attrs)
+          end
+        end
+      ensure
+        Thread.current[self.class.batched_audit_attrs_sym] = []
+      end
+
+
       def write_audit(attrs)
-        attrs[:associated] = send(audit_associated_with) unless audit_associated_with.nil?
+        return unless auditing_enabled && attrs.present?
+        attrs[:associated] = self.send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
 
-        if auditing_enabled
+        augmented_attrs = augment_attrs(attrs)
+
+        if self.async_enabled
+          # Audit Call backs are not called
+          # Combine audits are not called
+          async_write_audit(augmented_attrs)
+        else
           run_callbacks(:audit) {
-            audit = audits.create(attrs)
-            combine_audits_if_needed if attrs[:action] != 'create'
+            audit = audits.create(augmented_attrs)
+            combine_audits_if_needed if augmented_attrs[:action] != 'create'
             audit
           }
         end
       end
 
-      # Add all of the details necessary for creating an audit record
-      # without having the original objects around. Adds the attributes to a
-      # class attribute that batches them up for later processing.
-      def async_write_audit(attrs)
+      # Overridable method
+      # Populate `Audit` record attributes in an attributes hash
+      # Executed synchronously. So avoid database calls.
+      # Use `before_create` callbacks for database calls.
+      def augment_attrs(attrs)
         attrs[:auditable_id] = self.id
         attrs[:auditable_type] = self.class.name
         attrs.delete(:auditable) # don't bother sending whole object to queue
@@ -273,13 +319,41 @@ module Audited
           attrs[:associated_type] = attrs[:associated].class.name
           attrs.delete(:associated)
         end
-        user = Thread.current[:audited_user]
+
+        # Set up before_create attributes manually so that this can work async too
+        user = audit_user
         if user
-          attrs[:user_id] = user.id
-          attrs[:user_type] = user.class.name
+          if user.is_a?(::ActiveRecord::Base)
+            attrs[:user_id] = user.id
+            attrs[:user_type] = user.class.name
+          else
+            attrs[:username] = user
+          end
         end
-        attrs[:created_at] = Time.now
+
+        attrs[:request_uuid] = request_uuid
+        attrs[:remote_address] = remote_address
+        attrs[:created_at] = Time.now.utc.round(10).iso8601(6)
+        attrs
+      end
+
+      # Add all of the details necessary for creating an audit record
+      # without having the original objects around. Adds the attributes to a
+      # class attribute that batches them up for later processing.
+      def async_write_audit(attrs)
         (Thread.current[self.class.batched_audit_attrs_sym] ||= []) << attrs
+      end
+
+      def audit_user
+        ::Audited.store[:audited_user] || ::Audited.store[:current_user].try!(:call)
+      end
+
+      def request_uuid
+       ::Audited.store[:current_request_uuid] || SecureRandom.uuid
+      end
+
+      def remote_address
+       ::Audited.store[:current_remote_address]
       end
 
       def presence_of_audit_comment
@@ -333,14 +407,6 @@ module Audited
         attributes = {}
         audits.each { |audit| attributes.merge!(audit.new_attributes) }
         attributes
-      end
-
-      def async_enabled
-        self.class.async_enabled
-      end
-
-      def async_enabled= val
-        self.class.async_enabled = val
       end
 
     end # InstanceMethods
